@@ -52,22 +52,20 @@ cat > "$MACOS/$APP_NAME" << 'LAUNCHER_EOF'
 
 # WhisperAI App Launcher for macOS with animated loading
 
-# Prefer the project checkout when this app is run from dist/. Fall back to
-# the app bundle root when the bundle has been moved elsewhere.
+# Use the app bundle as the application root. Runtime dependencies live in
+# Application Support so the built app does not depend on the source checkout.
 LAUNCHER_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-PROJECT_ROOT="$( cd "$LAUNCHER_DIR" && cd ../../../.. && pwd )"
 APP_ROOT="$( cd "$LAUNCHER_DIR" && cd ../.. && pwd )"
+SCRIPT_DIR="$APP_ROOT"
+SUPPORT_DIR="$HOME/Library/Application Support/WhisperAI"
+LOG_FILE="$SUPPORT_DIR/.whisperai.log"
 
-if [ -f "$PROJECT_ROOT/main.py" ] && [ -f "$PROJECT_ROOT/requirements.txt" ]; then
-    SCRIPT_DIR="$PROJECT_ROOT"
-else
-    SCRIPT_DIR="$APP_ROOT"
-fi
-
-LOG_FILE="$SCRIPT_DIR/.whisperai.log"
+mkdir -p "$SUPPORT_DIR"
 
 # GUI apps launched from Finder usually do not inherit shell PATH.
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PYTHONNOUSERSITE=1
+unset PYTHONPATH
 
 # Colors for output
 RED='\033[0;31m'
@@ -121,6 +119,40 @@ log_msg() {
     echo "[$(date '+%H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
+install_requirements() {
+    echo -n "${CYAN}○${NC} Updating pip... "
+    ("${PYTHON_CMD[@]}" -m pip install -q --upgrade pip >> "$LOG_FILE" 2>&1) &
+    if ! show_spinner "Updating pip" $!; then
+        echo "${RED}✗ Failed to update pip${NC}"
+        log_msg "ERROR: Failed to update pip"
+        return 1
+    fi
+    
+    echo -n "${CYAN}○${NC} Installing dependencies... "
+    echo "   (This may take 3-5 minutes on first run)"
+    echo ""
+    
+    ("${PYTHON_CMD[@]}" -m pip install -r "$SCRIPT_DIR/requirements.txt" >> "$LOG_FILE" 2>&1) &
+    PIP_PID=$!
+
+    if ! show_spinner "Installing dependencies" $PIP_PID; then
+        echo "${RED}✗ Installation failed${NC}"
+        log_msg "ERROR: Failed to install requirements"
+        return 1
+    fi
+}
+
+verify_python_environment() {
+    "${PYTHON_CMD[@]}" - <<'PY_CHECK' >> "$LOG_FILE" 2>&1
+import numpy
+import whisper
+import PyQt5
+
+print("Dependency check OK")
+print("NumPy:", numpy.__version__, numpy.__file__)
+PY_CHECK
+}
+
 # Main launcher logic
 {
     echo "=== WhisperAI Launcher Started ==="
@@ -148,12 +180,16 @@ log_msg() {
     fi
     echo "${GREEN}✓${NC}"
     
-    VENV_PATH="$SCRIPT_DIR/venv"
+    VENV_PATH="$SUPPORT_DIR/venv"
+    PYTHON_BOOTSTRAP="/usr/bin/python3"
+    if [ ! -x "$PYTHON_BOOTSTRAP" ]; then
+        PYTHON_BOOTSTRAP="$(command -v python3)"
+    fi
     
     # Check/create venv
     echo -n "${CYAN}○${NC} Preparing virtual environment... "
     if [ ! -d "$VENV_PATH" ]; then
-        (PYTHONPATH= python3 -m venv "$VENV_PATH" >> "$LOG_FILE" 2>&1) &
+        (PYTHONPATH= "$PYTHON_BOOTSTRAP" -m venv "$VENV_PATH" >> "$LOG_FILE" 2>&1) &
         show_spinner "Preparing virtual environment" $!
     else
         echo "${GREEN}✓${NC}"
@@ -184,28 +220,37 @@ log_msg() {
         fi
     fi
     
-    # Upgrade pip
-    echo -n "${CYAN}○${NC} Updating pip... "
-    ("${PYTHON_CMD[@]}" -m pip install -q --upgrade pip >> "$LOG_FILE" 2>&1) &
-    if ! show_spinner "Updating pip" $!; then
-        echo "${RED}✗ Failed to update pip${NC}"
-        log_msg "ERROR: Failed to update pip"
+    if ! install_requirements; then
+        echo "${RED}✗ Installation failed${NC}"
         exit 1
     fi
-    
-    # Install requirements
-    echo -n "${CYAN}○${NC} Installing dependencies... "
-    echo "   (This may take 3-5 minutes on first run)"
-    echo ""
-    
-    # Show visual progress
-    ("${PYTHON_CMD[@]}" -m pip install -r "$SCRIPT_DIR/requirements.txt" >> "$LOG_FILE" 2>&1) &
-    PIP_PID=$!
 
-    if ! show_spinner "Installing dependencies" $PIP_PID; then
-        echo "${RED}✗ Installation failed${NC}"
-        log_msg "ERROR: Failed to install requirements"
-        exit 1
+    echo -n "${CYAN}○${NC} Checking Python packages... "
+    if ! verify_python_environment; then
+        echo "${YELLOW}rebuilding environment${NC}"
+        log_msg "Dependency check failed; rebuilding virtual environment"
+        deactivate 2>/dev/null || true
+        rm -rf "$VENV_PATH"
+        (PYTHONPATH= "$PYTHON_BOOTSTRAP" -m venv "$VENV_PATH" >> "$LOG_FILE" 2>&1) &
+        if ! show_spinner "Rebuilding virtual environment" $!; then
+            echo "${RED}✗ Failed to rebuild venv${NC}"
+            log_msg "ERROR: Failed to rebuild venv"
+            exit 1
+        fi
+        source "$VENV_PATH/bin/activate"
+        PYTHON_CMD=("$VENV_PATH/bin/python")
+        TORCH_DEPS="$VENV_PATH/lib/python3.9/site-packages/torch/lib/libtorch_global_deps.dylib"
+        if [ "$(uname -m)" = "arm64" ] && [ -f "$TORCH_DEPS" ] && file "$TORCH_DEPS" | grep -q "x86_64"; then
+            PYTHON_CMD=(arch -x86_64 "$VENV_PATH/bin/python")
+        fi
+        if ! install_requirements || ! verify_python_environment; then
+            echo "${RED}✗ Python packages are still broken${NC}"
+            log_msg "ERROR: Python packages are still broken after rebuild"
+            exit 1
+        fi
+        echo "${GREEN}✓${NC}"
+    else
+        echo "${GREEN}✓${NC}"
     fi
     
     # Check ffmpeg
